@@ -1,14 +1,60 @@
 name: notify
 on:
   push:
+  issues:
+    types: [opened]
 
 jobs:
   slack:
     runs-on: ubuntu-latest
     steps:
+      - name: Build message
+        id: build
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            HEAD_COMMIT=$(jq -r '.head_commit' "$GITHUB_EVENT_PATH")
+
+            if [ "$HEAD_COMMIT" = "null" ]; then
+              # 新規ブランチ作成など、新しいcommitが無いpush
+              MSG=$(jq -r '
+                "Branch: " + .ref
+                  + "\\nHome: https://github.com/" + .repository.full_name
+              ' "$GITHUB_EVENT_PATH")
+            else
+              RAW_TS=$(jq -r '.head_commit.timestamp' "$GITHUB_EVENT_PATH")
+              DATE_FMT=$(date -d "$RAW_TS" +"%Y-%m-%d (%a, %d %b %Y)")
+
+              MSG=$(jq -r --arg date "$DATE_FMT" '
+                def esc: gsub("\""; "\\\"") | gsub("\n"; "\\n");
+                ( [ (.head_commit.added[]?    | "A " + .),
+                    (.head_commit.modified[]? | "M " + .),
+                    (.head_commit.removed[]?  | "D " + .) ] | join("\\n") ) as $paths
+                | "Branch: " + .ref
+                  + "\\nHome: https://github.com/" + .repository.full_name
+                  + "\\nCommit: " + .head_commit.id
+                  + "\\n" + .head_commit.url
+                  + "\\nAuthor: " + (.head_commit.author.name | esc) + " <" + .head_commit.author.email + ">"
+                  + "\\nDate: " + $date
+                  + "\\n\\nChanged paths:\\n" + $paths
+                  + "\\n\\nLog Message:\\n-----------\\n" + (.head_commit.message | esc)
+              ' "$GITHUB_EVENT_PATH")
+            fi
+          else
+            MSG=$(jq -r '
+              def esc: gsub("\""; "\\\"") | gsub("\n"; "\\n");
+              "[New Issue] " + .repository.full_name + " #" + (.issue.number | tostring) + " " + (.issue.title | esc)
+                + "\\n" + .issue.html_url
+                + "\\nAuthor: " + .issue.user.login
+            ' "$GITHUB_EVENT_PATH")
+          fi
+
+          echo "message=$MSG" >> "$GITHUB_OUTPUT"
+
       - uses: slackapi/slack-github-action@v2
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
-            text: "Branch: ${{ github.ref_name }}\nRepo: ${{ github.repository }}\nCommit: ${{ github.sha }}\nAuthor: ${{ github.event.head_commit.author.name }}\nDate: ${{ github.event.head_commit.timestamp }}\nChanged paths: ${{ join(github.event.head_commit.added, ', ') }} ${{ join(github.event.head_commit.modified, ', ') }} ${{ join(github.event.head_commit.removed, ', ') }}\nLog Message:\n${{ github.event.head_commit.message }}\nCompare: ${{ github.event.compare }}"
+            text: "${{ steps.build.outputs.message }}"
