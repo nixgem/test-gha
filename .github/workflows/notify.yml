@@ -7,11 +7,14 @@ on:
 jobs:
   slack:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Build message
         id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "$EVENT_NAME" = "push" ]; then
             HEAD_COMMIT=$(jq -r '.head_commit' "$GITHUB_EVENT_PATH")
@@ -26,12 +29,28 @@ jobs:
               RAW_TS=$(jq -r '.head_commit.timestamp' "$GITHUB_EVENT_PATH")
               DATE_FMT=$(date -d "$RAW_TS" +"%Y-%m-%d (%a, %d %b %Y)")
 
-              MSG=$(jq -r --arg date "$DATE_FMT" '
+              BEFORE=$(jq -r '.before' "$GITHUB_EVENT_PATH")
+              AFTER=$(jq -r '.after' "$GITHUB_EVENT_PATH")
+              REPO=$(jq -r '.repository.full_name' "$GITHUB_EVENT_PATH")
+
+              # head_commitのadded/modified/removedは、マージコミットだと
+              # 空になることがあるので、compare APIから実際の差分を取る
+              PATHS=$(curl -s \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/compare/$BEFORE...$AFTER" \
+                | jq -r '
+                  [ .files[]? | (
+                      (if .status == "added" then "A"
+                       elif .status == "removed" then "D"
+                       elif .status == "renamed" then "R"
+                       else "M" end) + " " + .filename
+                    ) ] | join("\\n")
+                ')
+
+              MSG=$(jq -r --arg date "$DATE_FMT" --arg paths "$PATHS" '
                 def esc: gsub("\""; "\\\"") | gsub("\n"; "\\n");
-                ( [ (.head_commit.added[]?    | "A " + .),
-                    (.head_commit.modified[]? | "M " + .),
-                    (.head_commit.removed[]?  | "D " + .) ] | join("\\n") ) as $paths
-                | "Branch: " + .ref
+                "Branch: " + .ref
                   + "\\nHome: https://github.com/" + .repository.full_name
                   + "\\nCommit: " + .head_commit.id
                   + "\\n" + .head_commit.url
