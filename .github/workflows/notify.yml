@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Build message
+      - name: Build payload
         id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -21,59 +21,72 @@ jobs:
 
             if [ "$HEAD_COMMIT" = "null" ]; then
               # 新規ブランチ作成など、新しいcommitが無いpush
-              MSG=$(jq -r '
-                "Branch: " + .ref
-                  + "\\nHome: https://github.com/" + .repository.full_name
-              ' "$GITHUB_EVENT_PATH")
+              jq '
+                {
+                  text: ("Branch: " + .ref
+                    + "\nHome: https://github.com/" + .repository.full_name)
+                }
+              ' "$GITHUB_EVENT_PATH" > payload.json
             else
               RAW_TS=$(jq -r '.head_commit.timestamp' "$GITHUB_EVENT_PATH")
               DATE_FMT=$(date -d "$RAW_TS" +"%Y-%m-%d (%a, %d %b %Y)")
 
-              BEFORE=$(jq -r '.before' "$GITHUB_EVENT_PATH")
               AFTER=$(jq -r '.after' "$GITHUB_EVENT_PATH")
               REPO=$(jq -r '.repository.full_name' "$GITHUB_EVENT_PATH")
 
               # head_commitのadded/modified/removedは、マージコミットだと
-              # 空になることがあるので、compare APIから実際の差分を取る
-              PATHS=$(curl -s \
+              # 空になることがあるので、commit APIから実際の差分を取る
+              # (compareだと新規ブランチ初回pushでbeforeが0000...0になり失敗するため、
+              #  AFTER単体のcommit diffを使う)
+              API_RESPONSE=$(curl -s \
                 -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/$REPO/compare/$BEFORE...$AFTER" \
-                | jq -r '
+                "https://api.github.com/repos/$REPO/commits/$AFTER")
+
+              PATHS=$(echo "$API_RESPONSE" | jq -r '
                   [ .files[]? | (
                       (if .status == "added" then "A"
                        elif .status == "removed" then "D"
                        elif .status == "renamed" then "R"
                        else "M" end) + " " + .filename
-                    ) ] | join("\\n")
+                    ) ] | join("\n")
                 ')
 
-              MSG=$(jq -r --arg date "$DATE_FMT" --arg paths "$PATHS" '
-                def esc: gsub("\""; "\\\"") | gsub("\n"; "\\n");
-                "Branch: " + .ref
-                  + "\\nHome: https://github.com/" + .repository.full_name
-                  + "\\nCommit: " + .head_commit.id
-                  + "\\n" + .head_commit.url
-                  + "\\nAuthor: " + (.head_commit.author.name | esc) + " <" + .head_commit.author.email + ">"
-                  + "\\nDate: " + $date
-                  + "\\n\\nChanged paths:\\n" + $paths
-                  + "\\n\\nLog Message:\\n-----------\\n" + (.head_commit.message | esc)
-              ' "$GITHUB_EVENT_PATH")
+              if [ -z "$PATHS" ]; then
+                echo "::warning::Changed pathsが取得できませんでした。API応答: $(echo "$API_RESPONSE" | head -c 300)"
+              fi
+
+              # textはjqでJSONとして組み立てる(エスケープはjqに任せるので\や"が
+              # commitメッセージに含まれていても安全)
+              jq --arg date "$DATE_FMT" --arg paths "$PATHS" '
+                {
+                  text: (
+                    "Branch: " + .ref
+                    + "\nHome: https://github.com/" + .repository.full_name
+                    + "\nCommit: " + .head_commit.id
+                    + "\n" + .head_commit.url
+                    + "\nAuthor: " + .head_commit.author.name + " <" + .head_commit.author.email + ">"
+                    + "\nDate: " + $date
+                    + "\n\nChanged paths:\n" + $paths
+                    + "\n\nLog Message:\n-----------\n" + .head_commit.message
+                  )
+                }
+              ' "$GITHUB_EVENT_PATH" > payload.json
             fi
           else
-            MSG=$(jq -r '
-              def esc: gsub("\""; "\\\"") | gsub("\n"; "\\n");
-              "[New Issue] " + .repository.full_name + " #" + (.issue.number | tostring) + " " + (.issue.title | esc)
-                + "\\n" + .issue.html_url
-                + "\\nAuthor: " + .issue.user.login
-            ' "$GITHUB_EVENT_PATH")
+            jq '
+              {
+                text: ("[New Issue] " + .repository.full_name + " #" + (.issue.number | tostring) + " " + .issue.title
+                  + "\n" + .issue.html_url
+                  + "\nAuthor: " + .issue.user.login)
+              }
+            ' "$GITHUB_EVENT_PATH" > payload.json
           fi
 
-          echo "message=$MSG" >> "$GITHUB_OUTPUT"
+          cat payload.json
 
       - uses: slackapi/slack-github-action@v3
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
-          payload: |
-            text: "${{ steps.build.outputs.message }}"
+          payload-file-path: payload.json
